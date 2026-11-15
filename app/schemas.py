@@ -68,3 +68,32 @@ class PublishResponse(BaseModel):
     version: int = Field(description="发布后的新版本号")
     published_job_id: int
     variant_count: int
+
+
+class ReportCreate(BaseModel):
+    dataset_a_id: int = Field(description="数据集 A 编号")
+    dataset_b_id: int = Field(description="数据集 B 编号")
+
+
+class ReportItemOut(BaseModel):
+    chrom: str = Field(description="归一化后的染色体（双方一致）")
+    pos: int = Field(description="归一化后的 1-based 坐标")
+    ref: str = Field(description="归一化后的 REF")
+    alt: str = Field(description="归一化后的 ALT")
+    lines_a: list[int] = Field(description="该位点在数据集 A 已发布版本中的原始 VCF 行号")
+    lines_b: list[int] = Field(description="该位点在数据集 B 已发布版本中的原始 VCF 行号")
+
+
+class ReportOut(BaseModel):
+    id: int = Field(description="报告号，供后续复核读取")
+    dataset_a_id: int
+    dataset_b_id: int
+    version_a: int = Field(description="生成时点数据集 A 的已发布版本号")
+    version_b: int = Field(description="生成时点数据集 B 的已发布版本号")
+    chrom: str = Field(description="双方已发布数据所属染色体")
+    common_count: int = Field(description="共同位点数")
+    created_at: str
+
+
+class ReportDetail(ReportOut):
+    items: list[ReportItemOut] = Field(description="共同位点明细（按坐标排序）")

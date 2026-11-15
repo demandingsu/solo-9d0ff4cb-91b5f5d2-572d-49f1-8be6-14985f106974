@@ -24,12 +24,27 @@ POS 非整数/越界、REF 超出染色体末端、多等位（ALT 含逗号）�
 **文件级致命错误**（HTTP 400，不产生任务）：FASTA 含多条序列、非法碱基字符、
 VCF 缺 `#CHROM` 头、非 UTF-8 文件。
 
+## 批次交集报告
+
+质控员核查两个批次的已发布变异是否重合：`POST /reports` 提交两个数据集号，
+服务按**归一化后的染色体、坐标、REF/ALT** 找出共同位点，保存**双方各自的原始行号**
+与**生成时点双方所用的已发布版本号**，返回报告号供后续复核（`GET /reports/{id}`）。
+
+- **快照一致**：报告在单个 `BEGIN IMMEDIATE` 事务内读取两份已发布数据并写入——
+  生成期间若有并发替换（发布同样需要写锁，被阻塞），报告仍来自**同一时点的两份完整
+  已发布数据**，版本号与位点内容不会跨版本撕裂；
+- **原子保存**：报告头与全部共同位点行同事务提交，保存失败整体回滚，**不留半份报告**；
+- **持久复核**：报告与已发布数据解耦，替换已发布数据后旧报告仍可按报告号读取；
+- **拒绝生成**：数据集不存在（404）、任一数据集尚未发布（409）、
+  双方染色体不同或缺失（422）。
+
 ## 一致性模型
 
 - 上传生成**暂存任务**（job），处理期间查询仍返回**完整旧版**；
 - 发布按 `数据集号 + expected_version`（查询所得版本）在**单事务内整体替换**；
 - **并发替换只允许版本匹配者成功**（乐观锁）：不匹配返回 409 及当前版本；
-- **坏行任务或发布失败不改动旧版**：失败任务发布返回 422 及逐行原因，任何失败均回滚。
+- **坏行任务或发布失败不改动旧版**：失败任务发布返回 422 及逐行原因，任何失败均回滚；
+- **交集报告**在单事务快照内生成：并发替换不撕裂、保存失败不留半份、替换后旧报告仍可按号读取。
 
 ## 快速开始
 
@@ -46,6 +61,17 @@ docker compose up --build
 ```bash
 python3 scripts/demo.py            # 默认 http://localhost:8000
 ```
+
+### 交集报告演示（共同位点 + 并发替换一致性 + 旧报告复核）
+
+```bash
+python3 scripts/demo_report.py     # 默认 http://localhost:8000
+```
+
+演示内容：两个批次发布后生成交集报告（共同位点、双方原始行号、所用版本）→
+后台线程反复重新发布数据集 A 的同时连续生成报告（逐份校验版本号与位点内容同源、
+无快照撕裂）→ 替换后按报告号复核旧报告（内容不变）→ 三类拒绝场景
+（未发布 409 / 染色体不同 422 / 不存在 404）。
 
 ### curl 示例
 
@@ -67,6 +93,13 @@ curl -s -X POST localhost:8000/datasets/1/publish \
 
 # 5. 查询任务状态（坏行明细 / 暂存结果）
 curl -s localhost:8000/datasets/1/jobs/1
+
+# 6. 生成两个数据集已发布变异的交集报告（返回报告号）
+curl -s -X POST localhost:8000/reports -H 'Content-Type: application/json' \
+     -d '{"dataset_a_id":1,"dataset_b_id":2}'
+
+# 7. 按报告号复核（已发布数据被替换后仍可读）
+curl -s localhost:8000/reports/1
 ```
 
 ## API 一览
@@ -79,6 +112,9 @@ curl -s localhost:8000/datasets/1/jobs/1
 | POST | `/datasets/{id}/uploads` | 上传 FASTA+VCF 并归一化，生成暂存任务 |
 | GET | `/datasets/{id}/jobs/{job_id}` | 任务状态、坏行明细、暂存的归一化结果 |
 | POST | `/datasets/{id}/publish` | 按 `expected_version` 乐观锁发布；409=版本冲突，422=任务含坏行 |
+| POST | `/reports` | 生成两数据集已发布变异的交集报告；404=数据集不存在，409=尚未发布，422=染色体不同 |
+| GET | `/reports` | 列出全部交集报告（摘要，不含明细） |
+| GET | `/reports/{id}` | 按报告号读取交集报告（含共同位点与双方行号；替换后仍可读） |
 | GET | `/healthz` | 健康检查 |
 
 ## 演示样本（`samples/`）
@@ -99,11 +135,13 @@ curl -s localhost:8000/datasets/1/jobs/1
 
 `bad.vcf`：5 条坏行（REF 不符、多等位、MNP、越界、CHROM 不符），用于演示坏行隔离。
 
+`chr2.fa` 与 `batch3_chr2.vcf`：chr2 演示批次，用于演示交集报告"染色体不同则拒绝"（422）。
+
 ## 本地开发与测试
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest tests/ -q          # 27 个测试：算法 + API + 并发发布
+.venv/bin/python -m pytest tests/ -q          # 32 个测试：算法 + API + 并发发布 + 交集报告
 DATABASE_PATH=data/variants.db .venv/bin/python -m uvicorn app.main:app --reload
 ```
 
@@ -115,10 +153,11 @@ app/
   normalize.py   归一化算法（核对/修剪/锚点/左对齐）
   parse.py       FASTA/VCF 结构解析
   service.py     逐行校验、归并等价位点
-  store.py       SQLite 存储与乐观锁发布事务
+  store.py       SQLite 存储、乐观锁发布事务、交集报告事务
   schemas.py     请求/响应模型
-samples/         演示用 FASTA 与三份 VCF
-scripts/demo.py  端到端演示脚本（仅标准库）
+samples/         演示用 FASTA 与 VCF（含 chr2 拒绝场景样本）
+scripts/demo.py         端到端演示：归并/乐观锁/坏行隔离（仅标准库）
+scripts/demo_report.py  交集报告演示：共同位点/并发替换/旧报告复核（仅标准库）
 tests/           pytest 测试
 Dockerfile / docker-compose.yml
 ```

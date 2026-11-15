@@ -3,10 +3,16 @@
 数据模型：
 - datasets：数据集，version 从 0 起，每次成功发布 +1；
 - jobs / job_variants：上传处理后的暂存结果（不影响已发布数据）；
-- variants：当前已发布的归一化位点（查询只读这张表）。
+- variants：当前已发布的归一化位点（查询只读这张表）；
+- reports / report_items：批次交集报告（报告头 + 共同位点行），持久保存。
 
 发布语义：单事务内校验 expected_version 并整体替换 variants，
 版本不匹配或任务含坏行时回滚，已发布数据保持不变。
+
+报告语义：单事务（BEGIN IMMEDIATE）内读取两个数据集的当前版本与全部
+已发布位点、计算交集并写入报告——读取期间并发发布被写锁阻塞，报告
+必然来自同一时点的两份完整已发布数据；任何失败整体回滚，不留半份报告；
+报告提交后与已发布数据解耦，后续替换不影响按报告号读取。
 """
 from __future__ import annotations
 
@@ -58,6 +64,27 @@ CREATE TABLE IF NOT EXISTS variants (
     lines_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_variants_dataset ON variants(dataset_id);
+
+CREATE TABLE IF NOT EXISTS reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_a_id INTEGER NOT NULL REFERENCES datasets(id),
+    dataset_b_id INTEGER NOT NULL REFERENCES datasets(id),
+    version_a    INTEGER NOT NULL,
+    version_b    INTEGER NOT NULL,
+    chrom        TEXT NOT NULL,
+    common_count INTEGER NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS report_items (
+    report_id    INTEGER NOT NULL REFERENCES reports(id),
+    pos          INTEGER NOT NULL,
+    ref          TEXT NOT NULL,
+    alt          TEXT NOT NULL,
+    lines_a_json TEXT NOT NULL,
+    lines_b_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_report_items_report ON report_items(report_id);
 """
 
 
@@ -84,6 +111,14 @@ class JobNotReadyError(Exception):
         super().__init__("任务含坏行，不可发布")
         self.status = status
         self.errors = errors
+
+
+class NotPublishedError(Exception):
+    """数据集尚未发布，无法生成交集报告。"""
+
+
+class ChromMismatchError(Exception):
+    """两个数据集已发布数据的染色体不同（或缺失），无法比较。"""
 
 
 class Store:
@@ -277,6 +312,163 @@ class Store:
         finally:
             conn.close()
 
+    # ---------- 批次交集报告 ----------
+
+    def create_report(self, dataset_a_id: int, dataset_b_id: int) -> dict:
+        """生成两个数据集当前已发布位点的交集报告。
+
+        在单个 BEGIN IMMEDIATE 事务内完成全部读取与写入：
+        - 读取期间并发发布（同样需要写锁）被阻塞，两份已发布数据来自
+          同一时点的一致快照，版本号与位点内容不会跨版本撕裂；
+        - 交集计算与报告写入在同一事务提交，任何失败整体回滚，
+          不会留下半份报告；
+        - 报告提交后与已发布数据解耦，后续替换不影响按报告号读取。
+
+        拒绝情形：数据集不存在（NotFoundError）、尚未发布
+        （NotPublishedError）、染色体不同或缺失（ChromMismatchError）。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            snap_a = self._published_snapshot(conn, dataset_a_id)
+            snap_b = self._published_snapshot(conn, dataset_b_id)
+
+            chrom_a, chrom_b = snap_a["chrom"], snap_b["chrom"]
+            if chrom_a is None or chrom_b is None:
+                raise ChromMismatchError("已发布数据缺少染色体信息，无法比较")
+            if chrom_a != chrom_b:
+                raise ChromMismatchError(
+                    f"染色体不同：数据集 {dataset_a_id} 为 {chrom_a}，"
+                    f"数据集 {dataset_b_id} 为 {chrom_b}"
+                )
+
+            items = self._intersect(snap_a["variants"], snap_b["variants"])
+            report_id = self._insert_report(
+                conn,
+                dataset_a_id,
+                dataset_b_id,
+                snap_a["version"],
+                snap_b["version"],
+                chrom_a,
+                items,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        report = self.get_report(report_id)
+        assert report is not None
+        return report
+
+    def get_report(self, report_id: int) -> dict | None:
+        """按报告号读取报告（含共同位点明细）；不存在返回 None。"""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if row is None:
+                return None
+            irows = conn.execute(
+                "SELECT pos, ref, alt, lines_a_json, lines_b_json FROM report_items "
+                "WHERE report_id = ? ORDER BY pos, ref, alt",
+                (report_id,),
+            ).fetchall()
+            return self._report_dict(row, irows)
+        finally:
+            conn.close()
+
+    def list_reports(self) -> list[dict]:
+        """列出全部报告（不含共同位点明细）。"""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT * FROM reports ORDER BY id").fetchall()
+            return [self._report_dict(r, None) for r in rows]
+        finally:
+            conn.close()
+
+    # ---------- 报告内部辅助 ----------
+
+    def _published_snapshot(self, conn: sqlite3.Connection, dataset_id: int) -> dict:
+        """在调用方事务内读取数据集当前已发布版本、染色体与全部位点。"""
+        ds = conn.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
+        if ds is None:
+            raise NotFoundError(f"数据集 {dataset_id} 不存在")
+        if ds["version"] == 0:
+            raise NotPublishedError(f"数据集 {dataset_id} 尚未发布")
+        vrows = conn.execute(
+            "SELECT chrom, pos, ref, alt, lines_json FROM variants "
+            "WHERE dataset_id = ? ORDER BY pos, ref, alt",
+            (dataset_id,),
+        ).fetchall()
+        chrom = vrows[0]["chrom"] if vrows else None
+        if chrom is None:  # 发布了空 VCF 的边缘情况：染色体取自任务记录
+            job = conn.execute(
+                "SELECT chrom FROM jobs WHERE id = ?", (ds["published_job_id"],)
+            ).fetchone()
+            chrom = job["chrom"] if job else None
+        return {
+            "version": ds["version"],
+            "chrom": chrom,
+            "variants": [self._variant_dict(v) for v in vrows],
+        }
+
+    @staticmethod
+    def _intersect(variants_a: list[dict], variants_b: list[dict]) -> list[dict]:
+        """按归一化后的 (pos, ref, alt) 求交集，保留双方各自的原始行号。
+
+        variants_a 已按 (pos, ref, alt) 排序，交集结果保持同样顺序。
+        """
+        lines_b = {(v["pos"], v["ref"], v["alt"]): v["lines"] for v in variants_b}
+        items = []
+        for v in variants_a:
+            key = (v["pos"], v["ref"], v["alt"])
+            if key in lines_b:
+                items.append(
+                    {
+                        "pos": v["pos"],
+                        "ref": v["ref"],
+                        "alt": v["alt"],
+                        "lines_a": v["lines"],
+                        "lines_b": lines_b[key],
+                    }
+                )
+        return items
+
+    @staticmethod
+    def _insert_report(
+        conn: sqlite3.Connection,
+        dataset_a_id: int,
+        dataset_b_id: int,
+        version_a: int,
+        version_b: int,
+        chrom: str,
+        items: list[dict],
+    ) -> int:
+        """在调用方事务内写入报告头与全部报告行（随同事务提交或回滚）。"""
+        cur = conn.execute(
+            "INSERT INTO reports (dataset_a_id, dataset_b_id, version_a, version_b, "
+            "chrom, common_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (dataset_a_id, dataset_b_id, version_a, version_b, chrom, len(items), _utcnow()),
+        )
+        report_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO report_items (report_id, pos, ref, alt, lines_a_json, lines_b_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    report_id,
+                    it["pos"],
+                    it["ref"],
+                    it["alt"],
+                    json.dumps(it["lines_a"]),
+                    json.dumps(it["lines_b"]),
+                )
+                for it in items
+            ],
+        )
+        return report_id
+
     # ---------- 行转换 ----------
 
     @staticmethod
@@ -315,4 +507,30 @@ class Store:
         }
         if variants is not None:
             d["variants"] = variants
+        return d
+
+    @staticmethod
+    def _report_dict(row: sqlite3.Row, item_rows: list[sqlite3.Row] | None) -> dict:
+        d = {
+            "id": row["id"],
+            "dataset_a_id": row["dataset_a_id"],
+            "dataset_b_id": row["dataset_b_id"],
+            "version_a": row["version_a"],
+            "version_b": row["version_b"],
+            "chrom": row["chrom"],
+            "common_count": row["common_count"],
+            "created_at": row["created_at"],
+        }
+        if item_rows is not None:
+            d["items"] = [
+                {
+                    "chrom": row["chrom"],
+                    "pos": r["pos"],
+                    "ref": r["ref"],
+                    "alt": r["alt"],
+                    "lines_a": json.loads(r["lines_a_json"]),
+                    "lines_b": json.loads(r["lines_b_json"]),
+                }
+                for r in item_rows
+            ]
         return d
