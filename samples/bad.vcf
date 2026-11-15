@@ -1,0 +1,9 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=40>
+##source=bad-batch
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	17	.	C	G	50	PASS	BAD=ref-mismatch
+chr1	17	.	A	G,T	50	PASS	BAD=multiallelic
+chr1	18	.	TT	GA	50	PASS	BAD=mnp
+chr1	100	.	A	T	50	PASS	BAD=beyond-chrom-end
+chr2	5	.	A	AT	50	PASS	BAD=chrom-mismatch

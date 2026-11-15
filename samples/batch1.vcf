@@ -1,0 +1,10 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=40>
+##source=batch1
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	6	.	A	ATA	50	PASS	BATCH=1
+chr1	8	.	A	ATA	50	PASS	BATCH=1
+chr1	6	.	ATA	A	50	PASS	BATCH=1
+chr1	17	.	A	G	50	PASS	BATCH=1
+chr1	18	.	TT	GT	50	PASS	BATCH=1
+chr1	20	.	G	GA	50	PASS	BATCH=1
